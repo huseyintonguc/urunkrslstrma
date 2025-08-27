@@ -11,14 +11,13 @@ from typing import Tuple, Optional, Dict
 # ==========================
 st.set_page_config(layout="wide", page_title="Trendyol Ürün Karşılaştırma – Aktif Ürünler")
 st.title("Trendyol Ürün Listesi Karşılaştırma Aracı – Aktif Ürün Odaklı")
-st.caption("Tek dosya • sellers endpoint • aktif ürün filtresi • şablon indirme • hata ayıklama ve raporlar")
+st.caption("Tek dosya • sellers endpoint • aktif ürün filtresi • şablon indirme (XLSX yoksa CSV) • hata ayıklama ve raporlar")
 
 # ==========================
 # Yardımcılar
 # ==========================
 
 def _get_secrets() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Streamlit secrets'ten kimlik bilgilerini okur ve eksikleri raporlar."""
     missing = []
     try:
         seller_id = str(st.secrets.get("SELLER_ID", "")).strip()
@@ -51,8 +50,7 @@ def _auth_headers(api_key: str, api_secret: str) -> Dict[str, str]:
 
 @st.cache_data(show_spinner=False, ttl=10 * 60)
 def fetch_products_from_trendyol(seller_id: str, headers: Dict[str, str], page_size: int = 200, only_active: bool = False, debug: bool = False) -> Tuple[pd.DataFrame, Optional[str]]:
-    """Trendyol'dan ürünleri çeker. only_active=True ise approved==True & quantity>0 filtrelenir."""
-    base_url = f"https://api.trendyol.com/integration/product/sellers/{seller_id}/products"  # <— sellers endpoint
+    base_url = f"https://api.trendyol.com/integration/product/sellers/{seller_id}/products"
     all_products = []
     page = 0
 
@@ -84,7 +82,6 @@ def fetch_products_from_trendyol(seller_id: str, headers: Dict[str, str], page_s
             except Exception as e:
                 return pd.DataFrame(), f"JSON/işleme hatası: {e}. Son yanıt: {last_text} (HTTP {last_status})"
 
-        # İlk sayfada boş ise ve debug açık ise bilgi ver
         if page == 0 and debug and len(page_items) == 0:
             st.info(f"İlk sayfa boş döndü. HTTP {last_status}\n\n{last_text}")
 
@@ -108,29 +105,35 @@ def normalize_products_df(df: pd.DataFrame) -> pd.DataFrame:
     if "lastUpdateDate" in out.columns and pd.api.types.is_object_dtype(out["lastUpdateDate"]):
         with pd.option_context('mode.chained_assignment', None):
             out["lastUpdateDate"] = pd.to_datetime(out["lastUpdateDate"], errors="coerce")
-    # id'yi stringe zorla
     if "productContentId" in out.columns:
         with pd.option_context('mode.chained_assignment', None):
             out["productContentId"] = out["productContentId"].astype(str)
     return out[desired]
 
 
-def try_read_excel(uploaded_file) -> Tuple[pd.DataFrame, Optional[str]]:
+def try_read_excel_or_csv(uploaded_file) -> Tuple[pd.DataFrame, Optional[str]]:
+    name = (getattr(uploaded_file, "name", "") or "").lower()
     try:
-        return pd.read_excel(uploaded_file), None
+        if name.endswith(".csv"):
+            return pd.read_csv(uploaded_file), None
+        # Önce openpyxl'ı deneyelim; yoksa pandas motoru varsayılanı dener
+        try:
+            import openpyxl  # noqa
+            return pd.read_excel(uploaded_file, engine="openpyxl"), None
+        except Exception:
+            return pd.read_excel(uploaded_file), None
     except Exception as e:
-        return pd.DataFrame(), f"Excel okunamadı: {e}"
+        return pd.DataFrame(), f"Dosya okunamadı: {e}"
 
 
 def smart_merge_prev_current(df_prev: pd.DataFrame, df_current: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
-    # Anahtar sütunu yoksa muadillerini ara
     if "productContentId" not in df_prev.columns:
         for k in ["contentId", "productId", "id"]:
             if k in df_prev.columns:
                 df_prev = df_prev.rename(columns={k: "productContentId"})
                 break
         if "productContentId" not in df_prev.columns:
-            return pd.DataFrame(), "Excel'de 'productContentId' veya muadili bir sütun bulunamadı."
+            return pd.DataFrame(), "Excel/CSV'de 'productContentId' veya muadili bir sütun bulunamadı."
     with pd.option_context('mode.chained_assignment', None):
         df_prev["productContentId"] = df_prev["productContentId"].astype(str)
         df_current["productContentId"] = df_current["productContentId"].astype(str)
@@ -175,7 +178,7 @@ with st.sidebar:
     only_active = st.checkbox("Sadece aktif ürünleri al (approved & quantity>0)", value=True)
     debug = st.checkbox("Hata ayıklama çıktısını göster", value=False)
     st.divider()
-    st.subheader("Excel Şablonu")
+    st.subheader("Şablon İndir (XLSX yoksa CSV)")
     st.write("Dünkü veriyi bu şablonla kaydedebilirsiniz.")
     template_df = pd.DataFrame({
         "productContentId": ["111111", "222222"],
@@ -183,10 +186,15 @@ with st.sidebar:
         "title": ["Örnek Ürün 1", "Örnek Ürün 2"],
         "vatRate": [20, 20],
     })
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        template_df.to_excel(writer, index=False, sheet_name="yesterday")
-    st.download_button("Excel Şablonunu İndir", data=buf.getvalue(), file_name="ornek_sablon.xlsx")
+    # XLSX yazıcı yoksa CSV'ye düş
+    try:
+        import openpyxl  # noqa
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            template_df.to_excel(writer, index=False, sheet_name="yesterday")
+        st.download_button("Excel Şablonunu İndir (XLSX)", data=buf.getvalue(), file_name="ornek_sablon.xlsx")
+    except Exception:
+        st.download_button("Şablonu İndir (CSV)", data=template_df.to_csv(index=False).encode("utf-8"), file_name="ornek_sablon.csv")
 
 # ==========================
 # 1. Adım – Güncel Ürün Listesi
@@ -212,19 +220,19 @@ if st.button("Trendyol'dan Güncel Ürünleri Çek"):
             st.dataframe(st.session_state.df_today_norm.head(50))
 
 # ==========================
-# 2. Adım – Dünkü Excel Yükleme ve Karşılaştırma
+# 2. Adım – Dünkü Excel/CSV Yükleme ve Karşılaştırma
 # ==========================
 if st.session_state.df_today_norm is not None:
     st.divider()
-    st.subheader("2. Adım: Dünkü Excel Dosyasını Yükleyin")
-    uploaded = st.file_uploader("Dünkü ürün listesini içeren Excel dosyasını seçin", type=["xlsx", "xls"]) 
+    st.subheader("2. Adım: Dünkü Excel/CSV Dosyasını Yükleyin")
+    uploaded = st.file_uploader("Dünkü ürünü içeren Excel/CSV dosyasını seçin", type=["xlsx", "xls", "csv"]) 
 
     if uploaded is not None:
-        df_prev, err = try_read_excel(uploaded)
+        df_prev, err = try_read_excel_or_csv(uploaded)
         if err:
             st.error(err)
         elif df_prev.empty:
-            st.warning("Yüklenen Excel boş görünüyor.")
+            st.warning("Yüklenen dosya boş görünüyor.")
         else:
             st.info(f"Yüklenen satır sayısı: {len(df_prev)}")
             with st.spinner("Dosyalar karşılaştırılıyor..."):
@@ -249,7 +257,7 @@ if st.session_state.df_today_norm is not None:
                     existing = [c for c in show_cols if c in missing_df.columns]
                     st.dataframe(missing_df[existing].head(200))
                     st.download_button(
-                        "Eksik Ürünler Raporu (CSV)", data=missing_df.to_csv(index=False), file_name="eksik_urunler.csv", mime="text/csv"
+                        "Eksik Ürünler Raporu (CSV)", data=missing_df.to_csv(index=False).encode("utf-8"), file_name="eksik_urunler.csv", mime="text/csv"
                     )
 
             with c2:
@@ -260,13 +268,13 @@ if st.session_state.df_today_norm is not None:
                     st.warning(f"Değişen alanı olan {len(diff_df)} kayıt var.")
                     st.dataframe(diff_df.head(200))
                     st.download_button(
-                        "Fark Raporu (CSV)", data=diff_df.to_csv(index=False), file_name="degisen_alanlar.csv", mime="text/csv"
+                        "Fark Raporu (CSV)", data=diff_df.to_csv(index=False).encode("utf-8"), file_name="degisen_alanlar.csv", mime="text/csv"
                     )
 
             with st.expander("Detaylı Birleştirme Çıktısı (Tüm Kolonlar)"):
                 st.dataframe(merged.head(300))
                 st.download_button(
-                    "Birleşik Çıktı (CSV)", data=merged.to_csv(index=False), file_name="birlesik_cikti.csv", mime="text/csv"
+                    "Birleşik Çıktı (CSV)", data=merged.to_csv(index=False).encode("utf-8"), file_name="birlesik_cikti.csv", mime="text/csv"
                 )
 
 # ==========================
@@ -276,8 +284,8 @@ with st.expander("İpuçları & SSS"):
     st.markdown(
         """
 - **Endpoint:** `sellers/{SELLER_ID}/products` kullanılıyor (mağazan bu uçta aktif).
-- **Aktif filtre:** Varsayılan olarak **approved=True** ve **quantity>0** olan ürünler alınır. 
+- **Aktif filtre:** Varsayılan **approved=True** ve **quantity>0**.
+- **Şablon indirme:** Sunucuda `xlsxwriter` yoksa otomatik **CSV**'ye düşer; varsa **openpyxl** ile XLSX verir.
 - **Rate limit (429):** Otomatik geri çekilme uygulanır.
-- **Şablon:** Soldan indirip dünün verisini aynı kolon adlarıyla yükleyebilirsin.
         """
     )
