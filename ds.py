@@ -34,7 +34,8 @@ def get_products_from_trendyol():
     page = 0
     size = 50
     while True:
-        url = f"https://api.trendyol.com/sapigw/suppliers/{SELLER_ID}/products?page={page}&size={size}"
+        # Doğru ve güncel API uç noktasını kullanıyoruz
+        url = f"https://api.trendyol.com/integration/product/sellers/{SELLER_ID}/products?page={page}&size={size}"
         try:
             response = requests.get(url, headers=HEADERS)
             response.raise_for_status()
